@@ -1,3 +1,4 @@
+import Algorithms
 import Combine
 import Foundation
 import LoopKit
@@ -9,13 +10,17 @@ import SwiftDate
 import Swinject
 import UserNotifications
 
-protocol DeviceDataManager {
+protocol DeviceDataManager: GlucoseSource {
     var pumpManager: PumpManagerUI? { get set }
+    var loopInProgress: Bool { get set }
     var pumpDisplayState: CurrentValueSubject<PumpDisplayState?, Never> { get }
     var recommendsLoop: PassthroughSubject<Void, Never> { get }
+    var bolusTrigger: PassthroughSubject<Bool, Never> { get }
+    var errorSubject: PassthroughSubject<Error, Never> { get }
     var pumpName: CurrentValueSubject<String, Never> { get }
     var pumpExpiresAtDate: CurrentValueSubject<Date?, Never> { get }
-    func heartbeat()
+    func heartbeat(date: Date)
+    func createBolusProgressReporter() -> DoseProgressReporter?
 }
 
 private let staticPumpManagers: [PumpManagerUI.Type] = [
@@ -31,16 +36,24 @@ private let staticPumpManagersByIdentifier: [String: PumpManagerUI.Type] = stati
 private let accessLock = NSRecursiveLock(label: "BaseDeviceDataManager.accessLock")
 
 final class BaseDeviceDataManager: DeviceDataManager, Injectable {
-    private let processQueue = DispatchQueue(label: "BaseDeviceDataManager.processQueue")
+    private let processQueue = DispatchQueue.markedQueue(label: "BaseDeviceDataManager.processQueue")
     @Injected() private var pumpHistoryStorage: PumpHistoryStorage!
     @Injected() private var storage: FileStorage!
     @Injected() private var broadcaster: Broadcaster!
+    @Injected() private var glucoseStorage: GlucoseStorage!
+    @Injected() private var settingsManager: SettingsManager!
 
     @Persisted(key: "BaseDeviceDataManager.lastEventDate") var lastEventDate: Date? = nil
     @SyncAccess(lock: accessLock) @Persisted(key: "BaseDeviceDataManager.lastHeartBeatTime") var lastHeartBeatTime: Date =
         .distantPast
 
     let recommendsLoop = PassthroughSubject<Void, Never>()
+    let bolusTrigger = PassthroughSubject<Bool, Never>()
+    let errorSubject = PassthroughSubject<Error, Never>()
+    let pumpNewStatus = PassthroughSubject<Void, Never>()
+    @SyncAccess private var pumpUpdateCancellable: AnyCancellable?
+    private var pumpUpdatePromise: Future<Bool, Never>.Promise?
+    @SyncAccess var loopInProgress: Bool = false
 
     var pumpManager: PumpManagerUI? {
         didSet {
@@ -58,11 +71,16 @@ final class BaseDeviceDataManager: DeviceDataManager, Injectable {
                     }
                     pumpExpiresAtDate.send(endTime)
                 }
-                pumpManager.setMustProvideBLEHeartbeat(true)
             } else {
                 pumpDisplayState.value = nil
+                pumpExpiresAtDate.send(nil)
+                pumpName.send("")
             }
         }
+    }
+
+    var hasBLEHeartbeat: Bool {
+        (pumpManager as? MockPumpManager) == nil
     }
 
     let pumpDisplayState = CurrentValueSubject<PumpDisplayState?, Never>(nil)
@@ -73,55 +91,69 @@ final class BaseDeviceDataManager: DeviceDataManager, Injectable {
         injectServices(resolver)
         setupPumpManager()
         UIDevice.current.isBatteryMonitoringEnabled = true
-        updatePumpData()
     }
 
     func setupPumpManager() {
-        if let pumpManagerRawValue = UserDefaults.standard.pumpManagerRawValue {
-            pumpManager = pumpManagerFromRawValue(pumpManagerRawValue)
+        pumpManager = UserDefaults.standard.pumpManagerRawValue.flatMap { pumpManagerFromRawValue($0) }
+    }
+
+    func createBolusProgressReporter() -> DoseProgressReporter? {
+        pumpManager?.createBolusProgressReporter(reportingOn: processQueue)
+    }
+
+    func heartbeat(date: Date) {
+        guard pumpUpdateCancellable == nil else {
+            warning(.deviceManager, "Pump updating already in progress. Skip updating.")
+            return
+        }
+
+        guard !loopInProgress else {
+            warning(.deviceManager, "Loop in progress. Skip updating.")
+            return
+        }
+
+        func update(_: Future<Bool, Never>.Promise?) {}
+
+        processQueue.safeSync {
+            lastHeartBeatTime = date
+            updatePumpData()
         }
     }
 
     private func updatePumpData() {
-        let now = Date()
-        var updateInterval: TimeInterval = 5.minutes.timeInterval
-
-        switch lastHeartBeatTime.timeIntervalSince(now) {
-        case let interval where interval < -10.minutes.timeInterval:
-            break
-        case let interval where interval < -5.minutes.timeInterval:
-            updateInterval = 1.minutes.timeInterval
-        default:
-            break
-        }
-
-        let interval = now.timeIntervalSince(lastHeartBeatTime)
-        guard interval >= updateInterval else {
-            debug(.deviceManager, "Last hearbeat \(interval / 60) min ago, skip updating the pump data")
-            return
-        }
-
-        heartbeat()
-    }
-
-    @SyncAccess(lock: accessLock) private var pumpUpdateInProgress = false
-
-    func heartbeat() {
         guard let pumpManager = pumpManager else {
             debug(.deviceManager, "Pump is not set, skip updating")
+            updateUpdateFinished(false)
             return
         }
-        guard !pumpUpdateInProgress else {
-            debug(.deviceManager, "Pump update in progress, skip updating")
-            return
-        }
+
         debug(.deviceManager, "Start updating the pump data")
-        pumpUpdateInProgress = true
-        lastHeartBeatTime = Date()
-        pumpManager.ensureCurrentPumpData {
-            debug(.deviceManager, "Pump Data updated")
-            self.pumpUpdateInProgress = false
+        pumpUpdateCancellable = Future<Bool, Never> { [unowned self] promise in
+            pumpUpdatePromise = promise
+            debug(.deviceManager, "Waiting for pump update and loop recommendation")
+            processQueue.safeSync {
+                pumpManager.ensureCurrentPumpData {
+                    debug(.deviceManager, "Pump data updated.")
+                }
+            }
         }
+        .timeout(60, scheduler: processQueue)
+        .replaceError(with: false)
+        .replaceEmpty(with: false)
+        .sink(receiveValue: updateUpdateFinished)
+    }
+
+    private func updateUpdateFinished(_ recommendsLoop: Bool) {
+        pumpUpdateCancellable = nil
+        pumpUpdatePromise = nil
+        if !recommendsLoop {
+            warning(.deviceManager, "Loop recommendation time out or got error. Trying to loop right now.")
+        }
+        guard !loopInProgress else {
+            warning(.deviceManager, "Loop already in progress. Skip recommendation.")
+            return
+        }
+        self.recommendsLoop.send()
     }
 
     private func pumpManagerFromRawValue(_ rawValue: [String: Any]) -> PumpManagerUI? {
@@ -141,6 +173,72 @@ final class BaseDeviceDataManager: DeviceDataManager, Injectable {
 
         return staticPumpManagersByIdentifier[managerIdentifier]
     }
+
+    // MARK: - GlucoseSource
+
+    @Persisted(key: "BaseDeviceDataManager.lastFetchGlucoseDate") private var lastFetchGlucoseDate: Date = .distantPast
+
+    func fetch() -> AnyPublisher<[BloodGlucose], Never> {
+        guard let medtronic = pumpManager as? MinimedPumpManager else {
+            warning(.deviceManager, "Fetch minilink glucose failed: Pump is not Medtronic")
+            return Just([]).eraseToAnyPublisher()
+        }
+
+        guard lastFetchGlucoseDate.addingTimeInterval(5.minutes.timeInterval) < Date() else {
+            return Just([]).eraseToAnyPublisher()
+        }
+
+        medtronic.cgmManagerDelegate = self
+
+        return Future<[BloodGlucose], Error> { promise in
+            self.processQueue.async {
+                medtronic.fetchNewDataIfNeeded { result in
+                    switch result {
+                    case .noData:
+                        debug(.deviceManager, "Minilink glucose is empty")
+                        promise(.success([]))
+                    case let .newData(glucose):
+                        let directions: [BloodGlucose.Direction?] = [nil]
+                            + glucose.windows(ofCount: 2).map { window -> BloodGlucose.Direction? in
+                                let pair = Array(window)
+                                guard pair.count == 2 else { return nil }
+                                let firstValue = Int(pair[0].quantity.doubleValue(for: .milligramsPerDeciliter))
+                                let secondValue = Int(pair[1].quantity.doubleValue(for: .milligramsPerDeciliter))
+                                return .init(trend: secondValue - firstValue)
+                            }
+
+                        let results = glucose.enumerated().map { index, sample -> BloodGlucose in
+                            let value = Int(sample.quantity.doubleValue(for: .milligramsPerDeciliter))
+                            return BloodGlucose(
+                                _id: sample.syncIdentifier,
+                                sgv: value,
+                                direction: directions[index],
+                                date: Decimal(Int(sample.date.timeIntervalSince1970 * 1000)),
+                                dateString: sample.date,
+                                unfiltered: nil,
+                                filtered: nil,
+                                noise: nil,
+                                glucose: value,
+                                type: "sgv"
+                            )
+                        }
+                        if let lastDate = results.last?.dateString {
+                            self.lastFetchGlucoseDate = lastDate
+                        }
+
+                        promise(.success(results))
+                    case let .error(error):
+                        warning(.deviceManager, "Fetch minilink glucose failed", error: error)
+                        promise(.failure(error))
+                    }
+                }
+            }
+        }
+        .timeout(60 * 3, scheduler: processQueue, options: nil, customError: nil)
+        .replaceError(with: [])
+        .replaceEmpty(with: [])
+        .eraseToAnyPublisher()
+    }
 }
 
 extension BaseDeviceDataManager: PumpManagerDelegate {
@@ -157,8 +255,7 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
     }
 
     func pumpManagerBLEHeartbeatDidFire(_: PumpManager) {
-        debug(.deviceManager, "Pump Heartbeat")
-        updatePumpData()
+        debug(.deviceManager, "Pump Heartbeat: do nothing. Pump connection is OK")
     }
 
     func pumpManagerMustProvideBLEHeartbeat(_: PumpManager) -> Bool {
@@ -166,8 +263,15 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
     }
 
     func pumpManager(_ pumpManager: PumpManager, didUpdate status: PumpManagerStatus, oldStatus _: PumpManagerStatus) {
+        dispatchPrecondition(condition: .onQueue(processQueue))
         debug(.deviceManager, "New pump status Bolus: \(status.bolusState)")
         debug(.deviceManager, "New pump status Basal: \(String(describing: status.basalDeliveryState))")
+
+        if case .inProgress = status.bolusState {
+            bolusTrigger.send(true)
+        } else {
+            bolusTrigger.send(false)
+        }
 
         let batteryPercent = Int((status.pumpBatteryChargeRemaining ?? 1) * 100)
         let battery = Battery(
@@ -198,13 +302,16 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
     }
 
     func pumpManagerWillDeactivate(_: PumpManager) {
+        dispatchPrecondition(condition: .onQueue(processQueue))
         pumpManager = nil
     }
 
     func pumpManager(_: PumpManager, didUpdatePumpRecordsBasalProfileStartEvents _: Bool) {}
 
     func pumpManager(_: PumpManager, didError error: PumpManagerError) {
-        info(.deviceManager, "error: \(error.localizedDescription)")
+        dispatchPrecondition(condition: .onQueue(processQueue))
+        debug(.deviceManager, "error: \(error.localizedDescription), reason: \(String(describing: error.failureReason))")
+        errorSubject.send(error)
     }
 
     func pumpManager(
@@ -214,6 +321,13 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
         completion: @escaping (_ error: Error?) -> Void
     ) {
         dispatchPrecondition(condition: .onQueue(processQueue))
+        debug(.deviceManager, "New pump events:\n\(events.map(\.title).joined(separator: "\n"))")
+
+        // filter buggy TBRs > maxBasal from MDT
+        let events = events.filter {
+            guard $0.type == .tempBasal else { return true }
+            return $0.dose?.unitsPerHour ?? 0 <= Double(settingsManager.pumpSettings.maxBasal)
+        }
         pumpHistoryStorage.storePumpEvents(events)
         lastEventDate = events.last?.date
         completion(nil)
@@ -244,13 +358,16 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
 
     func pumpManagerRecommendsLoop(_: PumpManager) {
         dispatchPrecondition(condition: .onQueue(processQueue))
-        pumpUpdateInProgress = false
-        debug(.deviceManager, "Recomends loop")
-        recommendsLoop.send()
+        debug(.deviceManager, "Pump recommends loop")
+        guard let promise = pumpUpdatePromise else {
+            warning(.deviceManager, "We do not waiting for loop recommendation at this time.")
+            return
+        }
+        promise(.success(true))
     }
 
     func startDateToFilterNewPumpEvents(for _: PumpManager) -> Date {
-        lastEventDate ?? Date().addingTimeInterval(-2.hours.timeInterval)
+        lastEventDate?.addingTimeInterval(-15.minutes.timeInterval) ?? Date().addingTimeInterval(-2.hours.timeInterval)
     }
 }
 
@@ -290,16 +407,33 @@ extension BaseDeviceDataManager: DeviceManagerDelegate {
         _: DeviceManager,
         logEventForDeviceIdentifier _: String?,
         type _: DeviceLogEntryType,
-        message _: String,
+        message: String,
         completion _: ((Error?) -> Void)?
-    ) {}
+    ) {
+        debug(.deviceManager, "Device message: \(message)")
+    }
+}
+
+extension BaseDeviceDataManager: CGMManagerDelegate {
+    func startDateToFilterNewData(for _: CGMManager) -> Date? {
+        glucoseStorage.syncDate().addingTimeInterval(-10.minutes.timeInterval) // additional time to calculate directions
+    }
+
+    func cgmManager(_: CGMManager, hasNew _: CGMReadingResult) {}
+
+    func cgmManagerWantsDeletion(_: CGMManager) {}
+
+    func cgmManagerDidUpdateState(_: CGMManager) {}
+
+    func credentialStoragePrefix(for _: CGMManager) -> String { "BaseDeviceDataManager" }
+
+    func cgmManager(_: CGMManager, didUpdate _: CGMManagerStatus) {}
 }
 
 // MARK: - AlertPresenter
 
 extension BaseDeviceDataManager: AlertPresenter {
     func issueAlert(_: Alert) {}
-
     func retractAlert(identifier _: Alert.Identifier) {}
 }
 

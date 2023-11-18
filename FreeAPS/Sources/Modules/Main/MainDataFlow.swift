@@ -9,22 +9,6 @@ enum Main {
 
         var id: Int { screen.id }
     }
-
-    enum Scene {
-        case authorized
-        case onboarding
-
-        var screen: Screen {
-            switch self {
-            case .authorized:
-                return .authorizedRoot
-            case .onboarding:
-                return .onboarding
-            }
-        }
-    }
 }
 
-protocol MainProvider: Provider {
-    var authorizationManager: AuthorizationManager! { get }
-}
+protocol MainProvider: Provider {}

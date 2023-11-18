@@ -11,6 +11,7 @@ protocol CarbsStorage {
     func syncDate() -> Date
     func recent() -> [CarbsEntry]
     func nightscoutTretmentsNotUploaded() -> [NigtscoutTreatment]
+    func deleteCarbs(at date: Date)
 }
 
 final class BaseCarbsStorage: CarbsStorage, Injectable {
@@ -40,16 +41,25 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
     }
 
     func syncDate() -> Date {
-        guard let events = storage.retrieve(OpenAPS.Monitor.carbHistory, as: [CarbsEntry].self),
-              let recent = events.filter({ $0.enteredBy != CarbsEntry.manual }).first
-        else {
-            return Date().addingTimeInterval(-1.days.timeInterval)
-        }
-        return recent.createdAt.addingTimeInterval(-6.minutes.timeInterval)
+        Date().addingTimeInterval(-1.days.timeInterval)
     }
 
     func recent() -> [CarbsEntry] {
         storage.retrieve(OpenAPS.Monitor.carbHistory, as: [CarbsEntry].self)?.reversed() ?? []
+    }
+
+    func deleteCarbs(at date: Date) {
+        processQueue.sync {
+            var allValues = storage.retrieve(OpenAPS.Monitor.carbHistory, as: [CarbsEntry].self) ?? []
+            guard let entryIndex = allValues.firstIndex(where: { $0.createdAt == date }) else {
+                return
+            }
+            allValues.remove(at: entryIndex)
+            storage.save(allValues, as: OpenAPS.Monitor.carbHistory)
+            broadcaster.notify(CarbsObserver.self, on: processQueue) {
+                $0.carbsDidUpdate(allValues)
+            }
+        }
     }
 
     func nightscoutTretmentsNotUploaded() -> [NigtscoutTreatment] {
@@ -65,7 +75,7 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
                 rate: nil,
                 eventType: .nsCarbCorrection,
                 createdAt: $0.createdAt,
-                entededBy: CarbsEntry.manual,
+                enteredBy: CarbsEntry.manual,
                 bolus: nil,
                 insulin: nil,
                 notes: nil,

@@ -69,10 +69,7 @@ struct Link<T>: ViewModifier where T: View {
     }
 
     func body(content: Content) -> some View {
-        ZStack {
-            NavigationLink(destination: NavigationLazyView(destination().asAny(), screen: screen)) {
-                EmptyView()
-            }.hidden()
+        NavigationLink(destination: NavigationLazyView(destination().asAny(), screen: screen)) {
             content
         }
     }
@@ -124,16 +121,6 @@ struct ClearButton: ViewModifier {
     }
 }
 
-struct ChevronCell: ViewModifier {
-    func body(content: Content) -> some View {
-        HStack {
-            content
-            Spacer()
-            Image(systemName: "chevron.forward").foregroundColor(.secondary)
-        }.contentShape(Rectangle())
-    }
-}
-
 extension View {
     func roundedBackground() -> some View {
         modifier(RoundedBackground())
@@ -144,7 +131,7 @@ extension View {
     }
 
     func navigationLink<V: BaseView>(to screen: Screen, from view: V) -> some View {
-        modifier(Link(destination: view.viewModel.view(for: screen), screen: screen))
+        modifier(Link(destination: view.state.view(for: screen), screen: screen))
     }
 
     func adaptsToSoftwareKeyboard() -> some View {
@@ -153,13 +140,9 @@ extension View {
 
     func modal<V: BaseView>(for screen: Screen?, from view: V) -> some View {
         onTapGesture {
-            view.viewModel.showModal(for: screen)
+            view.state.showModal(for: screen)
         }
     }
 
     func asAny() -> AnyView { .init(self) }
-
-    func chevronCell() -> some View {
-        modifier(ChevronCell())
-    }
 }

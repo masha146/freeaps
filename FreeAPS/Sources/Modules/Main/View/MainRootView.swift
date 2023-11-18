@@ -1,22 +1,21 @@
 import SwiftUI
+import Swinject
 
 extension Main {
     struct RootView: BaseView {
-        @EnvironmentObject var viewModel: ViewModel<Provider>
+        let resolver: Resolver
+        @StateObject var state = StateModel()
 
         var body: some View {
-            viewModel.view(for: viewModel.scene.screen)
-                .sheet(isPresented: $viewModel.isModalPresented) {
-                    NavigationView { self.viewModel.modal!.view }
+            router.view(for: .home)
+                .sheet(isPresented: $state.isModalPresented) {
+                    NavigationView { self.state.modal!.view }
                         .navigationViewStyle(StackNavigationViewStyle())
                 }
-                .alert(isPresented: $viewModel.isAlertPresented) {
-                    Alert(
-                        title: Text("Important message"),
-                        message: Text(viewModel.alertMessage),
-                        dismissButton: .default(Text("Dismiss"))
-                    )
+                .sheet(isPresented: $state.isSecondaryModalPresented) {
+                    state.secondaryModalView ?? EmptyView().asAny()
                 }
+                .onAppear(perform: configureView)
         }
     }
 }

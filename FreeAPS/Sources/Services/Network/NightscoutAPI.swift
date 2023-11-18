@@ -5,11 +5,12 @@ import Foundation
 class NightscoutAPI {
     init(url: URL, secret: String? = nil) {
         self.url = url
-        self.secret = secret
+        self.secret = secret?.nonEmpty
     }
 
     private enum Config {
         static let entriesPath = "/api/v1/entries/sgv.json"
+        static let uploadEntriesPath = "/api/v1/entries.json"
         static let treatmentsPath = "/api/v1/treatments.json"
         static let statusPath = "/api/v1/devicestatus.json"
         static let retryCount = 1
@@ -31,7 +32,7 @@ extension NightscoutAPI {
     func checkConnection() -> AnyPublisher<Void, Swift.Error> {
         struct Check: Codable, Equatable {
             var eventType = "Note"
-            var enteredBy = "feeaps-x://"
+            var enteredBy = "freeaps-x"
             var notes = "FreeAPS X connected"
         }
         let check = Check()
@@ -57,7 +58,7 @@ extension NightscoutAPI {
         components.host = url.host
         components.port = url.port
         components.path = Config.entriesPath
-        components.queryItems = [URLQueryItem(name: "count", value: "\(2000)")]
+        components.queryItems = [URLQueryItem(name: "count", value: "\(1600)")]
         if let date = sinceDate {
             let dateItem = URLQueryItem(
                 name: "find[dateString][$gte]",
@@ -77,6 +78,10 @@ extension NightscoutAPI {
         return service.run(request)
             .retry(Config.retryCount)
             .decode(type: [BloodGlucose].self, decoder: JSONCoding.decoder)
+            .catch { error -> AnyPublisher<[BloodGlucose], Swift.Error> in
+                warning(.nightscout, "Glucose fetching error: \(error.localizedDescription)")
+                return Just([]).setFailureType(to: Swift.Error.self).eraseToAnyPublisher()
+            }
             .map { glucose in
                 glucose
                     .map {
@@ -107,7 +112,7 @@ extension NightscoutAPI {
         ]
         if let date = sinceDate {
             let dateItem = URLQueryItem(
-                name: "find[created_at][$gte]",
+                name: "find[created_at][$gt]",
                 value: Formatter.iso8601withFractionalSeconds.string(from: date)
             )
             components.queryItems?.append(dateItem)
@@ -124,6 +129,39 @@ extension NightscoutAPI {
         return service.run(request)
             .retry(Config.retryCount)
             .decode(type: [CarbsEntry].self, decoder: JSONCoding.decoder)
+            .catch { error -> AnyPublisher<[CarbsEntry], Swift.Error> in
+                warning(.nightscout, "Carbs fetching error: \(error.localizedDescription)")
+                return Just([]).setFailureType(to: Swift.Error.self).eraseToAnyPublisher()
+            }
+            .eraseToAnyPublisher()
+    }
+
+    func deleteCarbs(at date: Date) -> AnyPublisher<Void, Swift.Error> {
+        var components = URLComponents()
+        components.scheme = url.scheme
+        components.host = url.host
+        components.port = url.port
+        components.path = Config.treatmentsPath
+        components.queryItems = [
+            URLQueryItem(name: "find[carbs][$exists]", value: "true"),
+            URLQueryItem(
+                name: "find[created_at][$eq]",
+                value: Formatter.iso8601withFractionalSeconds.string(from: date)
+            )
+        ]
+
+        var request = URLRequest(url: components.url!)
+        request.allowsConstrainedNetworkAccess = false
+        request.timeoutInterval = Config.timeout
+        request.httpMethod = "DELETE"
+
+        if let secret = secret {
+            request.addValue(secret.sha1(), forHTTPHeaderField: "api-secret")
+        }
+
+        return service.run(request)
+            .retry(Config.retryCount)
+            .map { _ in () }
             .eraseToAnyPublisher()
     }
 
@@ -142,11 +180,12 @@ extension NightscoutAPI {
             URLQueryItem(
                 name: "find[enteredBy][$ne]",
                 value: NigtscoutTreatment.local.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed)
-            )
+            ),
+            URLQueryItem(name: "find[duration][$exists]", value: "true")
         ]
         if let date = sinceDate {
             let dateItem = URLQueryItem(
-                name: "find[created_at][$gte]",
+                name: "find[created_at][$gt]",
                 value: Formatter.iso8601withFractionalSeconds.string(from: date)
             )
             components.queryItems?.append(dateItem)
@@ -163,6 +202,10 @@ extension NightscoutAPI {
         return service.run(request)
             .retry(Config.retryCount)
             .decode(type: [TempTarget].self, decoder: JSONCoding.decoder)
+            .catch { error -> AnyPublisher<[TempTarget], Swift.Error> in
+                warning(.nightscout, "TempTarget fetching error: \(error.localizedDescription)")
+                return Just([]).setFailureType(to: Swift.Error.self).eraseToAnyPublisher()
+            }
             .eraseToAnyPublisher()
     }
 
@@ -217,6 +260,30 @@ extension NightscoutAPI {
             request.addValue(secret.sha1(), forHTTPHeaderField: "api-secret")
         }
         request.httpBody = try! JSONCoding.encoder.encode(treatments)
+        request.httpMethod = "POST"
+
+        return service.run(request)
+            .retry(Config.retryCount)
+            .map { _ in () }
+            .eraseToAnyPublisher()
+    }
+
+    func uploadGlucose(_ glucose: [BloodGlucose]) -> AnyPublisher<Void, Swift.Error> {
+        var components = URLComponents()
+        components.scheme = url.scheme
+        components.host = url.host
+        components.port = url.port
+        components.path = Config.uploadEntriesPath
+
+        var request = URLRequest(url: components.url!)
+        request.allowsConstrainedNetworkAccess = false
+        request.timeoutInterval = Config.timeout
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if let secret = secret {
+            request.addValue(secret.sha1(), forHTTPHeaderField: "api-secret")
+        }
+        request.httpBody = try! JSONCoding.encoder.encode(glucose)
         request.httpMethod = "POST"
 
         return service.run(request)

@@ -3,7 +3,8 @@ import SwiftUI
 struct CurrentGlucoseView: View {
     @Binding var recentGlucose: BloodGlucose?
     @Binding var delta: Int?
-    let units: GlucoseUnits
+    @Binding var units: GlucoseUnits
+    @Binding var alarm: GlucoseAlarm?
 
     private var glucoseFormatter: NumberFormatter {
         let formatter = NumberFormatter()
@@ -13,6 +14,7 @@ struct CurrentGlucoseView: View {
             formatter.minimumFractionDigits = 1
             formatter.maximumFractionDigits = 1
         }
+        formatter.roundingMode = .halfUp
         return formatter
     }
 
@@ -41,10 +43,12 @@ struct CurrentGlucoseView: View {
                         ?? "--"
                 )
                 .font(.system(size: 24, weight: .bold))
+                .fixedSize()
+                .foregroundColor(alarm == nil ? .primary : .loopRed)
                 image.padding(.bottom, 2)
 
             }.padding(.leading, 4)
-            HStack(spacing: 2) {
+            HStack(alignment: .lastTextBaseline, spacing: 2) {
                 Text(
                     recentGlucose.map { dateFormatter.string(from: $0.dateString) } ?? "--"
                 ).font(.caption2).foregroundColor(.secondary)
@@ -54,7 +58,7 @@ struct CurrentGlucoseView: View {
                         } ??
                         "--"
 
-                ).font(.caption2).foregroundColor(.secondary)
+                ).font(.system(size: 12, weight: .bold))
             }
         }
     }
