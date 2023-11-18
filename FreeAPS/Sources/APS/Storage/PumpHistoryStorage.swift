@@ -9,9 +9,11 @@ protocol PumpHistoryObserver {
 
 protocol PumpHistoryStorage {
     func storePumpEvents(_ events: [NewPumpEvent])
+    func storeEvents(_ events: [PumpHistoryEvent])
     func storeJournalCarbs(_ carbs: Int)
     func recent() -> [PumpHistoryEvent]
     func nightscoutTretmentsNotUploaded() -> [NigtscoutTreatment]
+    func saveCancelTempEvents()
 }
 
 final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
@@ -45,16 +47,23 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                     )]
                 case .tempBasal:
                     guard let dose = event.dose else { return [] }
-                    let rate = Decimal(string: dose.unitsPerHour.description)
-                    let minutes = Int((dose.endDate - dose.startDate).timeInterval / 60)
+
+                    let rate = Decimal(dose.unitsPerHour)
+                    let minutes = (dose.endDate - dose.startDate).timeInterval / 60
+                    let delivered = dose.deliveredUnits
+                    let date = event.date
+
+                    let isCancel = !event.isMutable && delivered != nil
+                    guard !isCancel else { return [] }
+
                     return [
                         PumpHistoryEvent(
                             id: id,
                             type: .tempBasalDuration,
-                            timestamp: event.date,
+                            timestamp: date,
                             amount: nil,
                             duration: nil,
-                            durationMin: minutes,
+                            durationMin: Int(round(minutes)),
                             rate: nil,
                             temp: nil,
                             carbInput: nil
@@ -62,7 +71,7 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                         PumpHistoryEvent(
                             id: "_" + id,
                             type: .tempBasal,
-                            timestamp: event.date,
+                            timestamp: date,
                             amount: nil,
                             duration: nil,
                             durationMin: nil,
@@ -132,7 +141,7 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                 }
             }
 
-            self.processNewEvents(eventsToStore)
+            self.storeEvents(eventsToStore)
         }
     }
 
@@ -151,23 +160,24 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                     carbInput: carbs
                 )
             ]
-            self.processNewEvents(eventsToStore)
+            self.storeEvents(eventsToStore)
         }
     }
 
-    private func processNewEvents(_ events: [PumpHistoryEvent]) {
-        dispatchPrecondition(condition: .onQueue(processQueue))
-        let file = OpenAPS.Monitor.pumpHistory
-        var uniqEvents: [PumpHistoryEvent] = []
-        storage.transaction { storage in
-            storage.append(events, to: file, uniqBy: \.id)
-            uniqEvents = storage.retrieve(file, as: [PumpHistoryEvent].self)?
-                .filter { $0.timestamp.addingTimeInterval(1.days.timeInterval) > Date() }
-                .sorted { $0.timestamp > $1.timestamp } ?? []
-            storage.save(Array(uniqEvents), as: file)
-        }
-        broadcaster.notify(PumpHistoryObserver.self, on: processQueue) {
-            $0.pumpHistoryDidUpdate(uniqEvents)
+    func storeEvents(_ events: [PumpHistoryEvent]) {
+        processQueue.async {
+            let file = OpenAPS.Monitor.pumpHistory
+            var uniqEvents: [PumpHistoryEvent] = []
+            self.storage.transaction { storage in
+                storage.append(events, to: file, uniqBy: \.id)
+                uniqEvents = storage.retrieve(file, as: [PumpHistoryEvent].self)?
+                    .filter { $0.timestamp.addingTimeInterval(1.days.timeInterval) > Date() }
+                    .sorted { $0.timestamp > $1.timestamp } ?? []
+                storage.save(Array(uniqEvents), as: file)
+            }
+            self.broadcaster.notify(PumpHistoryObserver.self, on: self.processQueue) {
+                $0.pumpHistoryDidUpdate(uniqEvents)
+            }
         }
     }
 
@@ -191,7 +201,7 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                     rate: event.rate,
                     eventType: .nsTempBasal,
                     createdAt: event.timestamp,
-                    entededBy: NigtscoutTreatment.local,
+                    enteredBy: NigtscoutTreatment.local,
                     bolus: nil,
                     insulin: nil,
                     notes: nil,
@@ -221,7 +231,7 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                     rate: nil,
                     eventType: .bolus,
                     createdAt: event.timestamp,
-                    entededBy: NigtscoutTreatment.local,
+                    enteredBy: NigtscoutTreatment.local,
                     bolus: event,
                     insulin: event.amount,
                     notes: nil,
@@ -238,7 +248,7 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                     rate: nil,
                     eventType: .nsCarbCorrection,
                     createdAt: event.timestamp,
-                    entededBy: NigtscoutTreatment.local,
+                    enteredBy: NigtscoutTreatment.local,
                     bolus: nil,
                     insulin: nil,
                     notes: nil,
@@ -255,5 +265,37 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
         let treatments = Array(Set([bolusesAndCarbs, temps].flatMap { $0 }).subtracting(Set(uploaded)))
 
         return treatments.sorted { $0.createdAt! > $1.createdAt! }
+    }
+
+    func saveCancelTempEvents() {
+        let basalID = UUID().uuidString
+        let date = Date()
+
+        let events = [
+            PumpHistoryEvent(
+                id: basalID,
+                type: .tempBasalDuration,
+                timestamp: date,
+                amount: nil,
+                duration: nil,
+                durationMin: 0,
+                rate: nil,
+                temp: nil,
+                carbInput: nil
+            ),
+            PumpHistoryEvent(
+                id: "_" + basalID,
+                type: .tempBasal,
+                timestamp: date,
+                amount: nil,
+                duration: nil,
+                durationMin: nil,
+                rate: 0,
+                temp: .absolute,
+                carbInput: nil
+            )
+        ]
+
+        storeEvents(events)
     }
 }

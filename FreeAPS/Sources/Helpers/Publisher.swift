@@ -27,3 +27,28 @@ extension Publisher {
         zip(dropFirst()).eraseToAnyPublisher()
     }
 }
+
+extension Publisher {
+    func cancellable() -> some Cancellable {
+        sink { _ in } receiveValue: { _ in }
+    }
+}
+
+extension Publisher where Failure == Never {
+    func cancellable() -> some Cancellable {
+        sink { _ in }
+    }
+}
+
+typealias Lifetime = Set<AnyCancellable>
+
+extension Publisher where Failure == Never {
+    func weakAssign<T: AnyObject>(
+        to keyPath: ReferenceWritableKeyPath<T, Output>,
+        on object: T
+    ) -> AnyCancellable {
+        sink { [weak object] value in
+            object?[keyPath: keyPath] = value
+        }
+    }
+}

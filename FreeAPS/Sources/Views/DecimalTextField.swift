@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 struct DecimalTextField: UIViewRepresentable {
@@ -36,13 +37,13 @@ struct DecimalTextField: UIViewRepresentable {
             height: 44
         ))
         let clearButton = UIBarButtonItem(
-            title: "Clear",
+            title: NSLocalizedString("Clear", comment: "Clear button"),
             style: .plain,
             target: self,
             action: #selector(textfield.clearButtonTapped(button:))
         )
         let doneButton = UIBarButtonItem(
-            title: "Done",
+            title: NSLocalizedString("Done", comment: "Done button"),
             style: .done,
             target: self,
             action: #selector(textfield.doneButtonTapped(button:))
@@ -55,13 +56,20 @@ struct DecimalTextField: UIViewRepresentable {
         toolBar.setItems([clearButton, space, doneButton], animated: true)
         textfield.inputAccessoryView = toolBar
         if autofocus {
-            textfield.becomeFirstResponder()
+            DispatchQueue.main.async {
+                textfield.becomeFirstResponder()
+            }
         }
         return textfield
     }
 
-    func updateUIView(_: UITextField, context _: Context) {
-//        textField.text = formatter.string(for: value)
+    func updateUIView(_ textField: UITextField, context: Context) {
+        let coordinator = context.coordinator
+        if coordinator.isEditing {
+            coordinator.resetEditing()
+        } else if value != 0 {
+            textField.text = formatter.string(for: value)
+        }
     }
 
     func makeCoordinator() -> Coordinator {
@@ -73,6 +81,15 @@ struct DecimalTextField: UIViewRepresentable {
 
         init(_ textField: DecimalTextField) {
             parent = textField
+        }
+
+        private(set) var isEditing = false
+        private var editingCancellable: AnyCancellable?
+
+        func resetEditing() {
+            editingCancellable = Just(false)
+                .delay(for: 0.5, scheduler: DispatchQueue.main)
+                .weakAssign(to: \.isEditing, on: self)
         }
 
         func textField(
@@ -102,6 +119,7 @@ struct DecimalTextField: UIViewRepresentable {
 
                 // Set Value
                 let double = number.doubleValue
+                isEditing = true
                 parent.value = Decimal(double)
             }
 
@@ -114,6 +132,7 @@ struct DecimalTextField: UIViewRepresentable {
         ) {
             // Format value with formatter at End Editing
             textField.text = parent.formatter.string(for: parent.value)
+            isEditing = false
         }
     }
 }

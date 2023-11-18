@@ -22,18 +22,28 @@ struct BloodGlucose: JSON, Identifiable, Hashable {
     }
 
     var sgv: Int?
-    let direction: Direction?
-    let date: UInt64
+    var direction: Direction?
+    let date: Decimal
     let dateString: Date
-    let filtered: Double?
+    let unfiltered: Decimal?
+    let filtered: Decimal?
     let noise: Int?
-
     var glucose: Int?
 
+    let type: String?
+
     var isStateValid: Bool { sgv ?? 0 >= 39 && noise ?? 1 != 4 }
+
+    static func == (lhs: BloodGlucose, rhs: BloodGlucose) -> Bool {
+        lhs.dateString == rhs.dateString
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(dateString)
+    }
 }
 
-enum GlucoseUnits: String, JSON {
+enum GlucoseUnits: String, JSON, Equatable {
     case mgdL = "mg/dL"
     case mmolL = "mmol/L"
 

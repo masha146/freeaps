@@ -8,7 +8,7 @@ struct NigtscoutTreatment: JSON, Hashable, Equatable {
     var rate: Decimal?
     var eventType: EventType
     var createdAt: Date?
-    var entededBy: String?
+    var enteredBy: String?
     var bolus: PumpHistoryEvent?
     var insulin: Decimal?
     var notes: String?
@@ -16,7 +16,7 @@ struct NigtscoutTreatment: JSON, Hashable, Equatable {
     let targetTop: Decimal?
     let targetBottom: Decimal?
 
-    static let local = "freeaps-x://local"
+    static let local = "freeaps-x"
 
     static let empty = NigtscoutTreatment(from: "{}")!
 
@@ -38,7 +38,7 @@ extension NigtscoutTreatment {
         case rate
         case eventType
         case createdAt = "created_at"
-        case entededBy
+        case enteredBy
         case bolus
         case insulin
         case notes

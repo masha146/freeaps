@@ -3,7 +3,7 @@ import SwiftDate
 import Swinject
 
 protocol TempTargetsObserver {
-    func tempTargetsDidUpdate(_ targers: [TempTarget])
+    func tempTargetsDidUpdate(_ targets: [TempTarget])
 }
 
 protocol TempTargetsStorage {
@@ -31,6 +31,17 @@ final class BaseTempTargetsStorage: TempTargetsStorage, Injectable {
 
     private func storeTempTargets(_ targets: [TempTarget], isPresets: Bool) {
         processQueue.sync {
+            var targets = targets
+            if !isPresets {
+                if current() != nil, let newActive = targets.last(where: {
+                    $0.createdAt.addingTimeInterval(Int($0.duration).minutes.timeInterval) > Date()
+                        && $0.createdAt <= Date()
+                }) {
+                    // cancel current
+                    targets += [TempTarget.cancel(at: newActive.createdAt.addingTimeInterval(-1))]
+                }
+            }
+
             let file = isPresets ? OpenAPS.FreeAPS.tempTargetsPresets : OpenAPS.Settings.tempTargets
             var uniqEvents: [TempTarget] = []
             self.storage.transaction { storage in
@@ -50,12 +61,7 @@ final class BaseTempTargetsStorage: TempTargetsStorage, Injectable {
     }
 
     func syncDate() -> Date {
-        guard let events = storage.retrieve(OpenAPS.Settings.tempTargets, as: [TempTarget].self),
-              let recent = events.filter({ $0.enteredBy != TempTarget.manual }).first
-        else {
-            return Date().addingTimeInterval(-1.days.timeInterval)
-        }
-        return recent.createdAt.addingTimeInterval(-6.minutes.timeInterval)
+        Date().addingTimeInterval(-1.days.timeInterval)
     }
 
     func recent() -> [TempTarget] {
@@ -66,16 +72,20 @@ final class BaseTempTargetsStorage: TempTargetsStorage, Injectable {
         guard let last = recent().last else {
             return nil
         }
-        guard last.createdAt.addingTimeInterval(Int(last.duration).minutes.timeInterval) > Date() else {
+
+        guard last.createdAt.addingTimeInterval(Int(last.duration).minutes.timeInterval) > Date(), last.createdAt <= Date(),
+              last.duration != 0
+        else {
             return nil
         }
+
         return last
     }
 
     func nightscoutTretmentsNotUploaded() -> [NigtscoutTreatment] {
         let uploaded = storage.retrieve(OpenAPS.Nightscout.uploadedTempTargets, as: [NigtscoutTreatment].self) ?? []
 
-        let eventsManual = recent().filter { $0.enteredBy == CarbsEntry.manual }
+        let eventsManual = recent().filter { $0.enteredBy == TempTarget.manual }
         let treatments = eventsManual.map {
             NigtscoutTreatment(
                 duration: Int($0.duration),
@@ -85,7 +95,7 @@ final class BaseTempTargetsStorage: TempTargetsStorage, Injectable {
                 rate: nil,
                 eventType: .nsTempTarget,
                 createdAt: $0.createdAt,
-                entededBy: TempTarget.manual,
+                enteredBy: TempTarget.manual,
                 bolus: nil,
                 insulin: nil,
                 notes: nil,

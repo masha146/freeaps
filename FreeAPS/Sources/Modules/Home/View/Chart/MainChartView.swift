@@ -20,7 +20,7 @@ struct MainChartView: View {
     private enum Config {
         static let endID = "End"
         static let screenHours = 5
-        static let basalHeight: CGFloat = 60
+        static let basalHeight: CGFloat = 70
         static let topYPadding: CGFloat = 20
         static let bottomYPadding: CGFloat = 50
         static let minAdditionalWidth: CGFloat = 150
@@ -28,7 +28,7 @@ struct MainChartView: View {
         static let minGlucose = 70
         static let yLinesCount = 5
         static let bolusSize: CGFloat = 8
-        static let bolusScale: CGFloat = 3
+        static let bolusScale: CGFloat = 2.5
         static let carbsSize: CGFloat = 10
         static let carbsScale: CGFloat = 0.3
     }
@@ -37,12 +37,15 @@ struct MainChartView: View {
     @Binding var suggestion: Suggestion?
     @Binding var tempBasals: [PumpHistoryEvent]
     @Binding var boluses: [PumpHistoryEvent]
+    @Binding var suspensions: [PumpHistoryEvent]
     @Binding var hours: Int
     @Binding var maxBasal: Decimal
+    @Binding var autotunedBasalProfile: [BasalProfileEntry]
     @Binding var basalProfile: [BasalProfileEntry]
     @Binding var tempTargets: [TempTarget]
     @Binding var carbs: [CarbsEntry]
-    let units: GlucoseUnits
+    @Binding var timerDate: Date
+    @Binding var units: GlucoseUnits
 
     @State var didAppearTrigger = false
     @State private var glucoseDots: [CGRect] = []
@@ -52,14 +55,16 @@ struct MainChartView: View {
     @State private var tempBasalPath = Path()
     @State private var regularBasalPath = Path()
     @State private var tempTargetsPath = Path()
+    @State private var suspensionsPath = Path()
     @State private var carbsDots: [DotInfo] = []
     @State private var carbsPath = Path()
     @State private var glucoseYGange: GlucoseYRange = (0, 0, 0, 0)
     @State private var offset: CGFloat = 0
+    @State private var cachedMaxBasalRate: Decimal?
 
     private let calculationQueue = DispatchQueue(label: "MainChartView.calculationQueue")
 
-    private var dateDormatter: DateFormatter {
+    private var dateFormatter: DateFormatter {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter
@@ -88,6 +93,9 @@ struct MainChartView: View {
         return formatter
     }
 
+    @Environment(\.horizontalSizeClass) var hSizeClass
+    @Environment(\.verticalSizeClass) var vSizeClass
+
     // MARK: - Views
 
     var body: some View {
@@ -96,6 +104,18 @@ struct MainChartView: View {
                 yGridView(fullSize: geo.size)
                 mainScrollView(fullSize: geo.size)
                 glucoseLabelsView(fullSize: geo.size)
+            }
+            .onChange(of: hSizeClass) { _ in
+                update(fullSize: geo.size)
+            }
+            .onChange(of: vSizeClass) { _ in
+                update(fullSize: geo.size)
+            }
+            .onReceive(
+                Foundation.NotificationCenter.default
+                    .publisher(for: UIDevice.orientationDidChangeNotification)
+            ) { _ in
+                update(fullSize: geo.size)
             }
         }
     }
@@ -142,7 +162,7 @@ struct MainChartView: View {
     }
 
     private func glucoseLabelsView(fullSize: CGSize) -> some View {
-        ForEach(0 ..< Config.yLinesCount + 1) { line -> AnyView in
+        ForEach(0 ..< Config.yLinesCount + 1, id: \.self) { line -> AnyView in
             let range = glucoseYGange
             let yStep = (range.maxY - range.minY) / CGFloat(Config.yLinesCount)
             let valueStep = Double(range.maxValue - range.minValue) / Double(Config.yLinesCount)
@@ -160,6 +180,7 @@ struct MainChartView: View {
         ZStack {
             tempBasalPath.fill(Color.tempBasal)
             tempBasalPath.stroke(Color.tempBasal, lineWidth: 1)
+            suspensionsPath.fill(Color.loopGray)
             regularBasalPath.stroke(Color.basal, lineWidth: 1)
         }
         .frame(width: fullGlucoseWidth(viewWidth: fullSize.width) + additionalWidth(viewWidth: fullSize.width))
@@ -168,10 +189,13 @@ struct MainChartView: View {
         .onChange(of: tempBasals) { _ in
             calculateBasalPoints(fullSize: fullSize)
         }
+        .onChange(of: suspensions) { _ in
+            calculateSuspensions(fullSize: fullSize)
+        }
         .onChange(of: maxBasal) { _ in
             calculateBasalPoints(fullSize: fullSize)
         }
-        .onChange(of: basalProfile) { _ in
+        .onChange(of: autotunedBasalProfile) { _ in
             calculateBasalPoints(fullSize: fullSize)
         }
         .onChange(of: didAppearTrigger) { _ in
@@ -196,23 +220,32 @@ struct MainChartView: View {
     }
 
     private func xGridView(fullSize: CGSize) -> some View {
-        Path { path in
-            for hour in 0 ..< hours + hours {
-                let x = firstHourPosition(viewWidth: fullSize.width) +
-                    oneSecondStep(viewWidth: fullSize.width) *
-                    CGFloat(hour) * CGFloat(1.hours.timeInterval)
+        ZStack {
+            Path { path in
+                for hour in 0 ..< hours + hours {
+                    let x = firstHourPosition(viewWidth: fullSize.width) +
+                        oneSecondStep(viewWidth: fullSize.width) *
+                        CGFloat(hour) * CGFloat(1.hours.timeInterval)
+                    path.move(to: CGPoint(x: x, y: 0))
+                    path.addLine(to: CGPoint(x: x, y: fullSize.height - 20))
+                }
+            }
+            .stroke(Color.secondary, lineWidth: 0.2)
+
+            Path { path in
+                let x = timeToXCoordinate(timerDate.timeIntervalSince1970, fullSize: fullSize)
                 path.move(to: CGPoint(x: x, y: 0))
                 path.addLine(to: CGPoint(x: x, y: fullSize.height - 20))
             }
+            .stroke(Color.secondary, style: StrokeStyle(lineWidth: 0.5, dash: [5]))
         }
-        .stroke(Color.secondary, lineWidth: 0.2)
     }
 
     private func timeLabelsView(fullSize: CGSize) -> some View {
         ZStack {
             // X time labels
-            ForEach(0 ..< hours + hours) { hour in
-                Text(dateDormatter.string(from: firstHourDate().addingTimeInterval(hour.hours.timeInterval)))
+            ForEach(0 ..< hours + hours, id: \.self) { hour in
+                Text(dateFormatter.string(from: firstHourDate().addingTimeInterval(hour.hours.timeInterval)))
                     .font(.caption)
                     .position(
                         x: firstHourPosition(viewWidth: fullSize.width) +
@@ -236,6 +269,9 @@ struct MainChartView: View {
             update(fullSize: fullSize)
         }
         .onChange(of: didAppearTrigger) { _ in
+            update(fullSize: fullSize)
+        }
+        .onReceive(Foundation.NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             update(fullSize: fullSize)
         }
     }
@@ -329,9 +365,6 @@ struct MainChartView: View {
         .onChange(of: suggestion) { _ in
             update(fullSize: fullSize)
         }
-        .onChange(of: didAppearTrigger) { _ in
-            update(fullSize: fullSize)
-        }
     }
 }
 
@@ -347,7 +380,8 @@ extension MainChartView {
         calculateBolusDots(fullSize: fullSize)
         calculateCarbsDots(fullSize: fullSize)
         calculateTempTargetsRects(fullSize: fullSize)
-        calculateTempTargetsRects(fullSize: fullSize)
+        calculateBasalPoints(fullSize: fullSize)
+        calculateSuspensions(fullSize: fullSize)
     }
 
     private func calculateGlucoseDots(fullSize: CGSize) {
@@ -439,23 +473,30 @@ extension MainChartView {
 
     private func calculateBasalPoints(fullSize: CGSize) {
         calculationQueue.async {
+            self.cachedMaxBasalRate = nil
             let dayAgoTime = Date().addingTimeInterval(-1.days.timeInterval).timeIntervalSince1970
             let firstTempTime = (tempBasals.first?.timestamp ?? Date()).timeIntervalSince1970
             var lastTimeEnd = firstTempTime
             let firstRegularBasalPoints = findRegularBasalPoints(
                 timeBegin: dayAgoTime,
                 timeEnd: firstTempTime,
-                fullSize: fullSize
+                fullSize: fullSize,
+                autotuned: false
             )
             let tempBasalPoints = firstRegularBasalPoints + tempBasals.chunks(ofCount: 2).map { chunk -> [CGPoint] in
                 let chunk = Array(chunk)
                 guard chunk.count == 2, chunk[0].type == .tempBasal, chunk[1].type == .tempBasalDuration else { return [] }
                 let timeBegin = chunk[0].timestamp.timeIntervalSince1970
                 let timeEnd = timeBegin + (chunk[1].durationMin ?? 0).minutes.timeInterval
-                let rateCost = Config.basalHeight / CGFloat(maxBasal)
+                let rateCost = Config.basalHeight / CGFloat(maxBasalRate())
                 let x0 = timeToXCoordinate(timeBegin, fullSize: fullSize)
                 let y0 = Config.basalHeight - CGFloat(chunk[0].rate ?? 0) * rateCost
-                let regularPoints = findRegularBasalPoints(timeBegin: lastTimeEnd, timeEnd: timeBegin, fullSize: fullSize)
+                let regularPoints = findRegularBasalPoints(
+                    timeBegin: lastTimeEnd,
+                    timeEnd: timeBegin,
+                    fullSize: fullSize,
+                    autotuned: false
+                )
                 lastTimeEnd = timeEnd
                 return regularPoints + [CGPoint(x: x0, y: y0)]
             }.flatMap { $0 }
@@ -475,17 +516,18 @@ extension MainChartView {
             }
 
             let endDateTime = dayAgoTime + 1.days.timeInterval + 6.hours.timeInterval
-            let regularBasalPoints = findRegularBasalPoints(
+            let autotunedBasalPoints = findRegularBasalPoints(
                 timeBegin: dayAgoTime,
                 timeEnd: endDateTime,
-                fullSize: fullSize
+                fullSize: fullSize,
+                autotuned: true
             )
 
-            let regularBasalPath = Path { path in
+            let autotunedBasalPath = Path { path in
                 var yPoint: CGFloat = Config.basalHeight
                 path.move(to: CGPoint(x: -50, y: yPoint))
 
-                for point in regularBasalPoints {
+                for point in autotunedBasalPoints {
                     path.addLine(to: CGPoint(x: point.x, y: yPoint))
                     path.addLine(to: point)
                     yPoint = point.y
@@ -495,21 +537,90 @@ extension MainChartView {
 
             DispatchQueue.main.async {
                 self.tempBasalPath = tempBasalPath
-                self.regularBasalPath = regularBasalPath
+                self.regularBasalPath = autotunedBasalPath
             }
         }
+    }
+
+    private func calculateSuspensions(fullSize: CGSize) {
+        calculationQueue.async {
+            var rects = suspensions.windows(ofCount: 2).map { window -> CGRect? in
+                let window = Array(window)
+                guard window[0].type == .pumpSuspend, window[1].type == .pumpResume else { return nil }
+                let x0 = self.timeToXCoordinate(window[0].timestamp.timeIntervalSince1970, fullSize: fullSize)
+                let x1 = self.timeToXCoordinate(window[1].timestamp.timeIntervalSince1970, fullSize: fullSize)
+                return CGRect(x: x0, y: 0, width: x1 - x0, height: Config.basalHeight)
+            }
+
+            let firstRec = self.suspensions.first.flatMap { event -> CGRect? in
+                guard event.type == .pumpResume else { return nil }
+                let tbrTime = self.tempBasals.last { $0.timestamp < event.timestamp }
+                    .map { $0.timestamp.timeIntervalSince1970 + TimeInterval($0.durationMin ?? 0) * 60 } ?? Date()
+                    .addingTimeInterval(-1.days.timeInterval).timeIntervalSince1970
+
+                let x0 = self.timeToXCoordinate(tbrTime, fullSize: fullSize)
+                let x1 = self.timeToXCoordinate(event.timestamp.timeIntervalSince1970, fullSize: fullSize)
+                return CGRect(
+                    x: x0,
+                    y: 0,
+                    width: x1 - x0,
+                    height: Config.basalHeight
+                )
+            }
+
+            let lastRec = self.suspensions.last.flatMap { event -> CGRect? in
+                guard event.type == .pumpSuspend else { return nil }
+                let tbrTimeX = self.tempBasals.first { $0.timestamp > event.timestamp }
+                    .map { self.timeToXCoordinate($0.timestamp.timeIntervalSince1970, fullSize: fullSize) }
+                let x0 = self.timeToXCoordinate(event.timestamp.timeIntervalSince1970, fullSize: fullSize)
+
+                let x1 = tbrTimeX ?? self.fullGlucoseWidth(viewWidth: fullSize.width) + self
+                    .additionalWidth(viewWidth: fullSize.width)
+
+                return CGRect(x: x0, y: 0, width: x1 - x0, height: Config.basalHeight)
+            }
+            rects.append(firstRec)
+            rects.append(lastRec)
+
+            let path = Path { path in
+                path.addRects(rects.compactMap { $0 })
+            }
+
+            DispatchQueue.main.async {
+                suspensionsPath = path
+            }
+        }
+    }
+
+    private func maxBasalRate() -> Decimal {
+        if let cached = cachedMaxBasalRate {
+            return cached
+        }
+
+        let maxRegularBasalRate = max(
+            basalProfile.map(\.rate).max() ?? maxBasal,
+            autotunedBasalProfile.map(\.rate).max() ?? maxBasal
+        )
+
+        var maxTempBasalRate = tempBasals.compactMap(\.rate).max() ?? maxRegularBasalRate
+        if maxTempBasalRate == 0 {
+            maxTempBasalRate = maxRegularBasalRate
+        }
+
+        cachedMaxBasalRate = max(maxTempBasalRate, maxRegularBasalRate)
+        return cachedMaxBasalRate ?? maxBasal
     }
 
     private func calculateTempTargetsRects(fullSize: CGSize) {
         calculationQueue.async {
             var rects = tempTargets.map { tempTarget -> CGRect in
                 let x0 = timeToXCoordinate(tempTarget.createdAt.timeIntervalSince1970, fullSize: fullSize)
-                let y0 = glucoseToYCoordinate(Int(tempTarget.targetTop), fullSize: fullSize)
+                let y0 = glucoseToYCoordinate(Int(tempTarget.targetTop ?? 0), fullSize: fullSize)
                 let x1 = timeToXCoordinate(
                     tempTarget.createdAt.timeIntervalSince1970 + Int(tempTarget.duration).minutes.timeInterval,
                     fullSize: fullSize
                 )
-                let y1 = glucoseToYCoordinate(Int(tempTarget.targetBottom), fullSize: fullSize)
+                let y1 = glucoseToYCoordinate(Int(tempTarget.targetBottom ?? 0), fullSize: fullSize)
                 return CGRect(
                     x: x0,
                     y: y0 - 3,
@@ -539,7 +650,12 @@ extension MainChartView {
         }
     }
 
-    private func findRegularBasalPoints(timeBegin: TimeInterval, timeEnd: TimeInterval, fullSize: CGSize) -> [CGPoint] {
+    private func findRegularBasalPoints(
+        timeBegin: TimeInterval,
+        timeEnd: TimeInterval,
+        fullSize: CGSize,
+        autotuned: Bool
+    ) -> [CGPoint] {
         guard timeBegin < timeEnd else {
             return []
         }
@@ -547,17 +663,19 @@ extension MainChartView {
         let calendar = Calendar.current
         let startOfDay = calendar.startOfDay(for: beginDate)
 
-        let basalNormalized = basalProfile.map {
+        let profile = autotuned ? autotunedBasalProfile : basalProfile
+
+        let basalNormalized = profile.map {
             (
                 time: startOfDay.addingTimeInterval($0.minutes.minutes.timeInterval).timeIntervalSince1970,
                 rate: $0.rate
             )
-        } + basalProfile.map {
+        } + profile.map {
             (
                 time: startOfDay.addingTimeInterval($0.minutes.minutes.timeInterval + 1.days.timeInterval).timeIntervalSince1970,
                 rate: $0.rate
             )
-        } + basalProfile.map {
+        } + profile.map {
             (
                 time: startOfDay.addingTimeInterval($0.minutes.minutes.timeInterval + 2.days.timeInterval).timeIntervalSince1970,
                 rate: $0.rate
@@ -571,7 +689,7 @@ extension MainChartView {
                     return nil
                 }
 
-                let rateCost = Config.basalHeight / CGFloat(maxBasal)
+                let rateCost = Config.basalHeight / CGFloat(maxBasalRate())
                 if window[0].time < timeBegin, window[1].time >= timeBegin {
                     let x = timeToXCoordinate(timeBegin, fullSize: fullSize)
                     let y = Config.basalHeight - CGFloat(window[0].rate) * rateCost
@@ -596,7 +714,7 @@ extension MainChartView {
             return CGPoint(x: timeToXCoordinate(Date().timeIntervalSince1970, fullSize: fullSize), y: Config.basalHeight)
         }
         let endBasalTime = lastBasal[0].timestamp.timeIntervalSince1970 + (lastBasal[1].durationMin?.minutes.timeInterval ?? 0)
-        let rateCost = Config.basalHeight / CGFloat(maxBasal)
+        let rateCost = Config.basalHeight / CGFloat(maxBasalRate())
         let x = timeToXCoordinate(endBasalTime, fullSize: fullSize)
         let y = Config.basalHeight - CGFloat(lastBasal[0].rate ?? 0) * rateCost
         return CGPoint(x: x, y: y)
@@ -653,6 +771,14 @@ extension MainChartView {
         .min()
     }
 
+    private func maxTargetValue() -> Int? {
+        tempTargets.map { $0.targetTop ?? 0 }.filter { $0 > 0 }.max().map(Int.init)
+    }
+
+    private func minTargetValue() -> Int? {
+        tempTargets.map { $0.targetBottom ?? 0 }.filter { $0 > 0 }.min().map(Int.init)
+    }
+
     private func glucoseToCoordinate(_ glucoseEntry: BloodGlucose, fullSize: CGSize) -> CGPoint {
         let x = timeToXCoordinate(glucoseEntry.dateString.timeIntervalSince1970, fullSize: fullSize)
         let y = glucoseToYCoordinate(glucoseEntry.glucose ?? 0, fullSize: fullSize)
@@ -673,10 +799,7 @@ extension MainChartView {
     }
 
     private func timeToXCoordinate(_ time: TimeInterval, fullSize: CGSize) -> CGFloat {
-        let xOffset = -(
-            glucose.first?.dateString.timeIntervalSince1970 ?? Date()
-                .addingTimeInterval(-1.days.timeInterval).timeIntervalSince1970
-        )
+        let xOffset = -Date().addingTimeInterval(-1.days.timeInterval).timeIntervalSince1970
         let stepXFraction = fullGlucoseWidth(viewWidth: fullSize.width) / CGFloat(hours.hours.timeInterval)
         let x = CGFloat(time + xOffset) * stepXFraction
         return x
@@ -685,14 +808,7 @@ extension MainChartView {
     private func glucoseToYCoordinate(_ glucoseValue: Int, fullSize: CGSize) -> CGFloat {
         let topYPaddint = Config.topYPadding + Config.basalHeight
         let bottomYPadding = Config.bottomYPadding
-        var maxValue = glucose.compactMap(\.glucose).max() ?? Config.maxGlucose
-        if let maxPredValue = maxPredValue() {
-            maxValue = max(maxValue, maxPredValue)
-        }
-        var minValue = glucose.compactMap(\.glucose).min() ?? Config.minGlucose
-        if let minPredValue = minPredValue() {
-            minValue = min(minValue, minPredValue)
-        }
+        let (minValue, maxValue) = minMaxYValues()
         let stepYFraction = (fullSize.height - topYPaddint - bottomYPadding) / CGFloat(maxValue - minValue)
         let yOffset = CGFloat(minValue) * stepYFraction
         let y = fullSize.height - CGFloat(glucoseValue) * stepYFraction + yOffset - bottomYPadding
@@ -724,17 +840,34 @@ extension MainChartView {
         return pointInLine(CGPoint(x: prevX, y: prevY), CGPoint(x: nextX, y: nextY), fraction)
     }
 
-    private func getGlucoseYRange(fullSize: CGSize) -> GlucoseYRange {
-        let topYPaddint = Config.topYPadding + Config.basalHeight
-        let bottomYPadding = Config.bottomYPadding
+    private func minMaxYValues() -> (min: Int, max: Int) {
         var maxValue = glucose.compactMap(\.glucose).max() ?? Config.maxGlucose
         if let maxPredValue = maxPredValue() {
             maxValue = max(maxValue, maxPredValue)
+        }
+        if let maxTargetValue = maxTargetValue() {
+            maxValue = max(maxValue, maxTargetValue)
         }
         var minValue = glucose.compactMap(\.glucose).min() ?? Config.minGlucose
         if let minPredValue = minPredValue() {
             minValue = min(minValue, minPredValue)
         }
+        if let minTargetValue = minTargetValue() {
+            minValue = min(minValue, minTargetValue)
+        }
+
+        if minValue == maxValue {
+            minValue = Config.minGlucose
+            maxValue = Config.maxGlucose
+        }
+
+        return (min: minValue, max: maxValue)
+    }
+
+    private func getGlucoseYRange(fullSize: CGSize) -> GlucoseYRange {
+        let topYPaddint = Config.topYPadding + Config.basalHeight
+        let bottomYPadding = Config.bottomYPadding
+        let (minValue, maxValue) = minMaxYValues()
         let stepYFraction = (fullSize.height - topYPaddint - bottomYPadding) / CGFloat(maxValue - minValue)
         let yOffset = CGFloat(minValue) * stepYFraction
         let maxY = fullSize.height - CGFloat(minValue) * stepYFraction + yOffset - bottomYPadding
@@ -743,12 +876,12 @@ extension MainChartView {
     }
 
     private func firstHourDate() -> Date {
-        let firstDate = glucose.first?.dateString ?? Date()
+        let firstDate = Date().addingTimeInterval(-1.days.timeInterval)
         return firstDate.dateTruncated(from: .minute)!
     }
 
     private func firstHourPosition(viewWidth: CGFloat) -> CGFloat {
-        let firstDate = glucose.first?.dateString ?? Date()
+        let firstDate = Date().addingTimeInterval(-1.days.timeInterval)
         let firstHour = firstHourDate()
 
         let lastDeltaTime = firstHour.timeIntervalSince(firstDate)

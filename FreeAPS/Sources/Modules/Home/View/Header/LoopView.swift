@@ -35,12 +35,20 @@ struct LoopView: View {
             if isLooping {
                 Text("looping").font(.caption2)
             } else if actualSuggestion?.timestamp != nil {
-                Text("\(Int((timerDate.timeIntervalSince(lastLoopDate) - Config.lag) / 60) + 1) min ago").font(.caption2)
+                Text(timeString).font(.caption2)
                     .foregroundColor(.secondary)
             } else {
                 Text("--").font(.caption2).foregroundColor(.secondary)
             }
         }
+    }
+
+    private var timeString: String {
+        let minAgo = Int((timerDate.timeIntervalSince(lastLoopDate) - Config.lag) / 60) + 1
+        if minAgo > 1440 {
+            return "--"
+        }
+        return "\(minAgo) " + NSLocalizedString("min ago", comment: "Minutes ago since last loop")
     }
 
     private var color: Color {
@@ -50,6 +58,9 @@ struct LoopView: View {
         let delta = timerDate.timeIntervalSince(lastLoopDate) - Config.lag
 
         if delta <= 5.minutes.timeInterval {
+            guard actualSuggestion?.deliverAt != nil else {
+                return .loopYellow
+            }
             return .loopGreen
         } else if delta <= 10.minutes.timeInterval {
             return .loopYellow
@@ -67,7 +78,7 @@ struct LoopView: View {
     }
 
     private var actualSuggestion: Suggestion? {
-        if closedLoop, suggestion?.rate != nil || suggestion?.units != nil {
+        if closedLoop, enactedSuggestion?.recieved == true {
             return enactedSuggestion ?? suggestion
         } else {
             return suggestion

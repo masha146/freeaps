@@ -7,8 +7,7 @@ protocol Provider {
 }
 
 class BaseProvider: Provider, Injectable {
-    var lifetime = Set<AnyCancellable>()
-    @Injected() var authorizationManager: AuthorizationManager!
+    var lifetime = Lifetime()
     @Injected() var deviceManager: DeviceDataManager!
     @Injected() var storage: FileStorage!
 
